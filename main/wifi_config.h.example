@@ -1,8 +1,0 @@
-// Copy this file to `main/wifi_config.h` and fill with your network credentials.
-// Keep `main/wifi_config.h` out of version control (see .gitignore).
-
-#pragma once
-
-// Required: replace with your network's SSID and password
-#define WIFI_SSID "your-ssid-here"
-#define WIFI_PASSWORD "your-password-here"

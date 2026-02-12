@@ -1,5 +1,5 @@
-# Ignore local WiFi credentials
-main/wifi_config.h
+# Ignore local config (copy `main/config.h.example` -> `main/config.h`)
+main/config.h
 
 # Common ESP-IDF / build artifacts
 build/

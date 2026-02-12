@@ -1,0 +1,12 @@
+// Copy this file to `main/config.h` and set your values.
+
+// WiFi credentials (used by the project)
+#define WIFI_SSID "your-ssid"
+#define WIFI_PASSWORD "your-password"
+
+// Default OTA URL used when triggering OTA without specifying a URL.
+#define OTA_URL_DEFAULT "http://example.com/firmware.bin"
+
+// mDNS hostname for the device (used as <name>.local). Example: "espressif"
+// Leave blank to skip mDNS initialization.
+#define MDNS_NAME "espressif"
