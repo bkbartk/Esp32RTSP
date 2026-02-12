@@ -1,0 +1,24 @@
+# Ignore local WiFi credentials
+main/wifi_config.h
+
+# Common ESP-IDF / build artifacts
+build/
+CMakeLists.txt.user
+cmake_build/
+sdkconfig
+sdkconfig.old
+*.cmake
+*.ninja
+
+# VSCode
+.vscode/
+
+# Partition and ELF outputs
+*.elf
+*.bin
+*.map
+
+# Serial/flasher args
+flash_args
+flasher_args.json
+

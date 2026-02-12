@@ -1,0 +1,5 @@
+dependencies:
+  idf:
+    version: "5.5.2"
+  espressif/esp32-camera: "^2.1.4"
+  espp/rtsp: "^1.0.34"
