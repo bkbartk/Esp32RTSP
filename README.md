@@ -20,7 +20,6 @@ Notes
 OTA (Over-The-Air)
 - Trigger OTA by visiting: `http://<device-ip>:8080/ota2`
 - Optionally provide a URL: `http://<device-ip>:8080/ota2?url=http://host/firmware.bin`
-- Hold the onboard OTA button (~300ms) to trigger OTA using `OTA_URL_DEFAULT`.
 - The default fallback OTA URL is defined in `main/config.h.example` as `OTA_URL_DEFAULT`.
 
 Board & Button

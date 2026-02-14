@@ -20,6 +20,10 @@
 #include "mqtt_client.h"
 #include "img_converters.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
 #ifndef OTA_URL_DEFAULT
 #define OTA_URL_DEFAULT "http://example.com/firmware.bin"
 #endif
@@ -32,6 +36,8 @@ const uint32_t MOTION_TIMEOUT = 3000; // 3 seconds
 const uint32_t MOTION_ON_DELAY = 100; // 100 ms debounce
 static uint32_t motion_start_candidate = 0;
 static esp_mqtt_client_handle_t client;
+
+QueueHandle_t motion_queue;
 
 void mqtt_init()
 {
@@ -57,6 +63,23 @@ void mqtt_init()
 }
 
 // ---------------- WIFI INIT (C++ SAFE) ----------------
+static void wifi_event_handler(void *arg,
+                               esp_event_base_t event_base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        auto *event = (ip_event_got_ip_t *)event_data;
+
+        char ip_str[16];
+        esp_ip4addr_ntoa(&event->ip_info.ip, ip_str, sizeof(ip_str));
+
+        ESP_LOGI("WIFI", "IP Address: %s", ip_str);
+        ESP_LOGI("RTSP_CAM", "Stream URL: rtsp://%s:8554/stream", ip_str);
+    }
+}
+
 static void wifi_init(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -65,13 +88,23 @@ static void wifi_init(void)
 
     esp_netif_create_default_wifi_sta();
 
+    // Register event handlers
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT,
+                                               ESP_EVENT_ANY_ID,
+                                               &wifi_event_handler,
+                                               nullptr));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,
+                                               IP_EVENT_STA_GOT_IP,
+                                               &wifi_event_handler,
+                                               nullptr));
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     wifi_config_t wifi_config{};
     std::memset(&wifi_config, 0, sizeof(wifi_config));
 
-    // Copy SSID/password from `main/wifi_config.h` (keep that file out of VCS)
     std::strncpy((char *)wifi_config.sta.ssid,
                  WIFI_SSID,
                  sizeof(wifi_config.sta.ssid));
@@ -87,6 +120,7 @@ static void wifi_init(void)
 
     ESP_LOGI("WIFI", "Connecting to WiFi...");
 }
+
 // ------------------------------------------------------
 
 // ---------------- CAMERA CONFIG -----------------------
@@ -212,6 +246,150 @@ static bool send_motion(bool motion)
 
     return changed;
 }
+
+void motion_task(void *arg)
+{
+    std::vector<uint8_t> *gray_ptr = nullptr;
+    std::vector<uint8_t> prev;
+
+    while (true)
+    {
+        if (xQueueReceive(motion_queue, &gray_ptr, portMAX_DELAY))
+        {
+
+            auto &gray = *gray_ptr;
+
+            if (!prev.empty() && prev.size() == gray.size())
+            {
+                bool motion = detect_motion(prev, gray, 20, 0.05f);
+                send_motion(motion);
+            }
+
+            prev = gray;
+
+            delete gray_ptr; // free safely
+        }
+    }
+}
+
+void start_motion_task()
+{
+    motion_queue = xQueueCreate(1, sizeof(std::vector<uint8_t> *));
+    xTaskCreatePinnedToCore(motion_task, "motion_task", 4096, nullptr, 5, nullptr, 1);
+}
+// RSTP SESSION HOTFIX
+#include <fcntl.h>
+#include <unistd.h>
+
+// Conservative upper bound for ESP32 FD table.
+// ESP-IDF typically defaults to 32, but we probe safely up to 64.
+static constexpr int MAX_POSSIBLE_FDS = 64;
+
+int get_free_fd_count()
+{
+    int used = 0;
+
+    for (int fd = 0; fd < MAX_POSSIBLE_FDS; fd++)
+    {
+        if (fcntl(fd, F_GETFD) != -1)
+        {
+            used++;
+        }
+    }
+
+    return MAX_POSSIBLE_FDS - used;
+}
+
+void rtsp_watchdog_task(void *arg)
+{
+    auto *server = static_cast<espp::RtspServer *>(arg);
+
+    const int FULL_FD = 64;
+    const TickType_t CHECK_INTERVAL = 200 / portTICK_PERIOD_MS;
+    const TickType_t RESTART_DELAY = 200 / portTICK_PERIOD_MS;
+    ESP_LOGI("RTSP", "Initial free FDs: %d", get_free_fd_count());
+
+    while (true)
+    {
+        int free_fds = get_free_fd_count();
+        ESP_LOGI("RTSP", "FD free: %d", free_fds);
+
+        // If FD count dropped, a session leaked sockets.
+        if (free_fds < FULL_FD)
+        {
+            ESP_LOGW("RTSP", "FD dropped to %d. Restarting RTSP server...", free_fds);
+            server->stop();
+            vTaskDelay(RESTART_DELAY);
+            server->start();
+        }
+
+        vTaskDelay(CHECK_INTERVAL);
+    }
+}
+
+//
+
+void camera_main_loop()
+{
+    // ---- Correct RTSP API ----
+    espp::RtspServer::Config rtsp_cfg;
+    rtsp_cfg.port = 8554; // only required field
+
+    espp::RtspServer server{rtsp_cfg};
+    vTaskDelay(1000 / portTICK_PERIOD_MS); // 1 second
+    server.start();
+    xTaskCreate(rtsp_watchdog_task, "rtsp_watchdog", 4096, &server, 5, nullptr);
+
+    // --------------------------
+
+    std::vector<uint8_t> rgb;
+    std::vector<uint8_t> gray;
+
+    while (true)
+    {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb)
+            continue;
+
+        // --- RTSP send ---
+        std::span<const uint8_t> jpeg_span(fb->buf, fb->len);
+        server.send_frame(espp::JpegFrame(jpeg_span));
+
+        // --- Resize buffers once ---
+        size_t rgb_size = fb->width * fb->height * 3;
+        size_t gray_size = fb->width * fb->height;
+
+        if (rgb.size() != rgb_size)
+            rgb.resize(rgb_size);
+        if (gray.size() != gray_size)
+            gray.resize(gray_size);
+
+        // --- JPEG → RGB ---
+        if (fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb.data()))
+        {
+
+            // --- RGB → grayscale ---
+            for (int i = 0, j = 0; i < rgb_size; i += 3, j++)
+            {
+                uint8_t r = rgb[i];
+                uint8_t g = rgb[i + 1];
+                uint8_t b = rgb[i + 2];
+                gray[j] = (r * 30 + g * 59 + b * 11) / 100;
+            }
+
+            // --- Send grayscale to motion task ---
+            if (uxQueueMessagesWaiting(motion_queue) == 0)
+            {
+                auto *frame = new std::vector<uint8_t>(gray); // allocate on heap
+                xQueueSend(motion_queue, &frame, 0);
+            }
+        }
+
+        esp_camera_fb_return(fb);
+        vTaskDelay(1);
+    }
+}
+
 static void ota()
 {
     httpd_handle_t server_handle = NULL;
@@ -259,7 +437,6 @@ static void ota()
     }
 }
 
-
 extern "C" void app_main(void)
 {
     wifi_init();
@@ -275,98 +452,21 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "Camera init failed");
         return;
     }
+
     sensor_t *s = esp_camera_sensor_get();
-    s->set_vflip(s, 1); // flip vertically
-    // s->set_hmirror(s, 1); // mirror horizontally (optional)
-    s->set_aec2(s, 1); // optional but helps stability
+    s->set_vflip(s, 1);
+    s->set_aec2(s, 1);
 
-    ESP_LOGI(TAG, "Camera initialised");
-
-    // ---- Correct RTSP API ----
-    espp::RtspServer::Config rtsp_cfg;
-    rtsp_cfg.port = 8554; // only required field
-
-    espp::RtspServer server{rtsp_cfg};
-    server.start();
-
-    ESP_LOGI(TAG, "RTSP server started");
-    ESP_LOGI(TAG, "Stream URL: rtsp://<IP>:8554/stream");
-    // --------------------------
-
-    // Button poll task: triggers OTA when button held for ~300ms
-    const gpio_num_t ota_button_gpio = GPIO_NUM_0;
-    gpio_set_direction(ota_button_gpio, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(ota_button_gpio, GPIO_PULLUP_ONLY);
-    xTaskCreate(+[](void *arg)
-                {
-        (void)arg;
-        int stable = 0;
-        while (true) {
-            int level = gpio_get_level(ota_button_gpio);
-            if (level == 0) { // pressed (active low)
-                stable++;
-                if (stable >= 3) { // ~300ms (3 * 100ms)
-                    start_ota_from_url(OTA_URL_DEFAULT);
-                    // wait until released
-                    while (gpio_get_level(ota_button_gpio) == 0) vTaskDelay(pdMS_TO_TICKS(100));
-                }
-            } else {
-                stable = 0;
-            }
-            vTaskDelay(pdMS_TO_TICKS(100));
-        } },
-                "ota_button", 2048, NULL, 5, NULL);
-
-    static std::vector<uint8_t> rgb;
-    static std::vector<uint8_t> gray;
-    static std::vector<uint8_t> prev_gray;
-    static bool prev_valid = false;
-
-    while (true)
+    ESP_LOGI(TAG, "Warming up camera...");
+    for (int i = 0; i < 10; i++)
     {
         camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb)
-            continue;
-
-        // --- RTSP send ---
-        std::vector<uint8_t> jpeg_data(fb->buf, fb->buf + fb->len);
-        espp::JpegFrame frame(jpeg_data);
-        server.send_frame(frame);
-
-        // --- Resize buffers once ---
-        size_t rgb_size = fb->width * fb->height * 3;
-        size_t gray_size = fb->width * fb->height;
-
-        if (rgb.size() != rgb_size)
-            rgb.resize(rgb_size);
-
-        if (gray.size() != gray_size)
-            gray.resize(gray_size);
-
-        // --- JPEG → RGB ---
-        if (fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb.data()))
-        {
-            // --- RGB → grayscale ---
-            for (int i = 0, j = 0; i < rgb_size; i += 3, j++)
-            {
-                uint8_t r = rgb[i];
-                uint8_t g = rgb[i + 1];
-                uint8_t b = rgb[i + 2];
-                gray[j] = (r * 30 + g * 59 + b * 11) / 100;
-            }
-
-            // --- Motion detection ---
-            if (prev_valid && prev_gray.size() == gray.size())
-            {
-                bool motion = detect_motion(prev_gray, gray, 20, 0.05f);
-                send_motion(motion); // your ON/OFF logic
-            }
-
-            prev_gray = gray;
-            prev_valid = true;
-        }
-
-        esp_camera_fb_return(fb);
-        vTaskDelay(1);
+        if (fb)
+            esp_camera_fb_return(fb);
+        vTaskDelay(30 / portTICK_PERIOD_MS);
     }
+    ESP_LOGI(TAG, "Camera ready.");
+
+    start_motion_task();
+    camera_main_loop(); // never returns
 }
