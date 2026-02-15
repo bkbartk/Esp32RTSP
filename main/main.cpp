@@ -281,8 +281,23 @@ void start_motion_task()
 #include <fcntl.h>
 #include <unistd.h>
 
-// Conservative upper bound for ESP32 FD table.
-// ESP-IDF typically defaults to 32, but we probe safely up to 64.
+void restart_camera()
+{
+    esp_camera_deinit();
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+
+    esp_err_t err = esp_camera_init(&camera_config);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("CAM", "Camera re-init failed: %s", esp_err_to_name(err));
+    }
+    else
+    {
+        ESP_LOGI("CAM", "Camera re-initialized");
+    }
+}
+
 static constexpr int MAX_POSSIBLE_FDS = 64;
 
 int get_free_fd_count()
@@ -300,6 +315,27 @@ int get_free_fd_count()
     return MAX_POSSIBLE_FDS - used;
 }
 
+volatile bool rtsp_error_detected = false;
+static char rtsp_log_buffer[256]; // static = no stack usage
+
+int rtsp_log_hook(const char *fmt, va_list args)
+{
+    // Format into static buffer (no large stack frame)
+    vsnprintf(rtsp_log_buffer, sizeof(rtsp_log_buffer), fmt, args);
+
+    if (strstr(rtsp_log_buffer, "TCP transport is not supported") ||
+        strstr(rtsp_log_buffer, "Failed to handle RTSP request") ||
+        strstr(rtsp_log_buffer, "Cannot create socket") ||
+        strstr(rtsp_log_buffer, "Socket invalid, cannot send") ||
+        strstr(rtsp_log_buffer, "Too many open files in system"))
+    {
+        rtsp_error_detected = true;
+    }
+
+    // Print original log
+    return vprintf(fmt, args);
+}
+
 void rtsp_watchdog_task(void *arg)
 {
     auto *server = static_cast<espp::RtspServer *>(arg);
@@ -307,20 +343,35 @@ void rtsp_watchdog_task(void *arg)
     const int FULL_FD = 64;
     const TickType_t CHECK_INTERVAL = 200 / portTICK_PERIOD_MS;
     const TickType_t RESTART_DELAY = 200 / portTICK_PERIOD_MS;
-    ESP_LOGI("RTSP", "Initial free FDs: %d", get_free_fd_count());
+
+    // ESP_LOGI("RTSP", "Initial free FDs: %d", get_free_fd_count());
 
     while (true)
     {
         int free_fds = get_free_fd_count();
-        ESP_LOGI("RTSP", "FD free: %d", free_fds);
+        // ESP_LOGI("RTSP", "FD free: %d", free_fds);
 
-        // If FD count dropped, a session leaked sockets.
         if (free_fds < FULL_FD)
         {
             ESP_LOGW("RTSP", "FD dropped to %d. Restarting RTSP server...", free_fds);
             server->stop();
             vTaskDelay(RESTART_DELAY);
             server->start();
+            continue;
+        }
+
+        if (rtsp_error_detected)
+        {
+            rtsp_error_detected = false;
+
+            ESP_LOGW("RTSP", "RTSP error detected. Restarting server...");
+
+            server->stop();
+            // restart_camera(); // optional
+            vTaskDelay(RESTART_DELAY);
+            server->start();
+
+            continue;
         }
 
         vTaskDelay(CHECK_INTERVAL);
@@ -439,6 +490,8 @@ static void ota()
 
 extern "C" void app_main(void)
 {
+    // Install log hook ONCE
+    esp_log_set_vprintf(rtsp_log_hook);
     wifi_init();
     ota();
 
