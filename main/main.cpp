@@ -168,6 +168,9 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_connect());
 
+    // optional: disable power save for smoother streaming
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
     ESP_LOGI("WIFI", "Connecting to WiFi...");
 }
 
@@ -187,10 +190,12 @@ static bool camera_init_safe()
 
 // ---------------- TASKS ----------------
 
-// 1. Capture Task: only grabs fb and pushes to RTSP queue
+// 1. Capture Task: grabs fb, builds motion buffer every Nth frame, sends fb to RTSP
 static void capture_task(void *arg)
 {
     ESP_LOGI(TAG, "Capture task started");
+
+    int motion_frame_counter = 0;
 
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -199,46 +204,7 @@ static void capture_task(void *arg)
             continue;
         }
 
-        if (xQueueSend(fbq_rtsp, &fb, 0) != pdTRUE) {
-            esp_camera_fb_return(fb);
-        }
-    }
-}
-
-// 2. Motion Task: consumes downscaled grayscale frames
-static void motion_task(void *arg)
-{
-    ESP_LOGI(TAG, "Motion task started");
-
-    uint8_t md_frame[MD_W * MD_H];
-
-    while (true) {
-        if (xQueueReceive(motion_gray_q, md_frame, portMAX_DELAY) == pdTRUE) {
-            if (motion_detect(md_frame)) {
-                ESP_LOGI(TAG, "Motion detected");
-                // TODO: MQTT publish if you want
-            }
-        }
-    }
-}
-
-// 3. RTSP Task: highest priority, does JPEG + motion every 5th frame
-static void rtsp_task(void *arg)
-{
-    ESP_LOGI(TAG, "RTSP task started");
-
-    while (!wifi_got_ip || !rtsp_started) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-
-    int motion_frame_counter = 0;
-
-    while (true) {
-        camera_fb_t *fb = nullptr;
-        if (xQueueReceive(fbq_rtsp, &fb, portMAX_DELAY) != pdTRUE)
-            continue;
-
-        // --- Motion every Nth frame (Y downscale from YUV422) ---
+        // --- Motion every Nth frame: build grayscale buffer from Y plane ---
         motion_frame_counter++;
         if (motion_frame_counter >= MOTION_INTERVAL) {
             motion_frame_counter = 0;
@@ -258,10 +224,49 @@ static void rtsp_task(void *arg)
                 }
             }
 
+            // send grayscale copy to motion queue (single-slot overwrite)
             xQueueOverwrite(motion_gray_q, md_frame);
         }
 
-        // --- JPEG for RTSP ---
+        // --- Send fb pointer to RTSP queue ---
+        if (xQueueSend(fbq_rtsp, &fb, 0) != pdTRUE) {
+            // if RTSP queue is full, drop frame
+            esp_camera_fb_return(fb);
+        }
+    }
+}
+
+// 2. Motion Task: consumes grayscale buffers, runs detection
+static void motion_task(void *arg)
+{
+    ESP_LOGI(TAG, "Motion task started");
+
+    uint8_t md_frame[MD_W * MD_H];
+
+    while (true) {
+        if (xQueueReceive(motion_gray_q, md_frame, portMAX_DELAY) == pdTRUE) {
+            if (motion_detect(md_frame)) {
+                ESP_LOGI(TAG, "Motion detected");
+                // TODO: MQTT publish if desired
+            }
+        }
+    }
+}
+
+// 3. RTSP Task: highest priority, only JPEG + send + fb_return
+static void rtsp_task(void *arg)
+{
+    ESP_LOGI(TAG, "RTSP task started");
+
+    while (!wifi_got_ip || !rtsp_started) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    while (true) {
+        camera_fb_t *fb = nullptr;
+        if (xQueueReceive(fbq_rtsp, &fb, portMAX_DELAY) != pdTRUE)
+            continue;
+
         uint8_t *jpeg_buf = nullptr;
         size_t jpeg_len = 0;
 
@@ -280,7 +285,7 @@ static void rtsp_task(void *arg)
         }
 
         esp_camera_fb_return(fb);
-        vTaskDelay(1);  // avoid starving idle/WDT
+        vTaskDelay(1);  // yield to avoid starving idle/WDT
     }
 }
 
