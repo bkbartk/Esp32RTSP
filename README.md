@@ -28,3 +28,26 @@ Board & Button
 
 Security
 - This OTA implementation allows insecure HTTPS (no certificate verification) for local/LAN updates. For production, enable certificate verification and signed firmware.
+
+
+                   +----------------+
+                   |  Capture Task  |
+                   |  (fb_get)      |
+                   +--------+-------+
+                            |
+                            v
+                 +----------+-----------+
+                 |                      |
+                 v                      v
+     +---------------------+   +----------------------+
+     | Motion Preprocess   |   |   RTSP Task          |
+     | (Y downscale every  |   | (fmt2jpg → send)     |
+     |  5th frame)         |   +----------+-----------+
+     +----------+----------+              |
+                |                         |
+                v                         v
+     +---------------------+        fb_return()
+     |   Motion Task       |
+     | (detect + MQTT)     |
+     +---------------------+
+

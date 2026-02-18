@@ -29,13 +29,14 @@ static const char *TAG = "PIPE";
 
 #define MD_W 40
 #define MD_H 30
-#define FRAME_QUEUE_LEN 4
-#define MOTION_QUEUE_LEN 4
+#define FBQ_LEN 4
+#define MOTIONQ_LEN 1
+#define MOTION_INTERVAL 5
 
 // ---------------- GLOBALS ----------------
 
-static QueueHandle_t fb_queue = nullptr;       // camera_fb_t*
-static QueueHandle_t motion_queue = nullptr;   // uint8_t[MD_W*MD_H]
+static QueueHandle_t fbq_rtsp = nullptr;      // camera_fb_t*
+static QueueHandle_t motion_gray_q = nullptr; // uint8_t[MD_W*MD_H]
 
 static uint8_t md_prev[MD_W * MD_H];
 static bool md_prev_valid = false;
@@ -72,8 +73,8 @@ static camera_config_t camera_config = {
     .ledc_timer   = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    .pixel_format = PIXFORMAT_YUV422,   // YUV422 for motion + JPEG encode
-    .frame_size   = FRAMESIZE_SVGA,     // 800x600
+    .pixel_format = PIXFORMAT_YUV422,
+    .frame_size   = FRAMESIZE_SVGA,
     .jpeg_quality = 10,
     .fb_count     = 2,
     .fb_location  = CAMERA_FB_IN_PSRAM,
@@ -129,7 +130,7 @@ static void wifi_event_handler(void *, esp_event_base_t base, int32_t id, void *
         wifi_got_ip = true;
 
         if (rtsp_server && !rtsp_started) {
-            rtsp_server->start();  // default accept timeout
+            rtsp_server->start();
             rtsp_started = true;
             ESP_LOGI(TAG, "RTSP server started: rtsp://%s:8554", ip_str);
         }
@@ -157,15 +158,10 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     wifi_config_t wifi_config{};
-    std::memset(&wifi_config, 0, sizeof(wifi_config));
+    memset(&wifi_config, 0, sizeof(wifi_config));
 
-    std::strncpy((char *)wifi_config.sta.ssid,
-                 WIFI_SSID,
-                 sizeof(wifi_config.sta.ssid));
-
-    std::strncpy((char *)wifi_config.sta.password,
-                 WIFI_PASSWORD,
-                 sizeof(wifi_config.sta.password));
+    strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    strncpy((char *)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -185,24 +181,15 @@ static bool camera_init_safe()
         return false;
     }
 
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-        s->set_brightness(s, 1);
-        s->set_contrast(s, 1);
-        s->set_saturation(s, 0);
-        s->set_gainceiling(s, GAINCEILING_4X);
-    }
-
     ESP_LOGI(TAG, "Camera initialized");
     return true;
 }
 
 // ---------------- TASKS ----------------
 
-// Capture: only grabs frames and pushes fb* to fb_queue
+// 1. Capture Task: only grabs fb and pushes to RTSP queue
 static void capture_task(void *arg)
 {
-    (void)arg;
     ESP_LOGI(TAG, "Capture task started");
 
     while (true) {
@@ -212,49 +199,69 @@ static void capture_task(void *arg)
             continue;
         }
 
-        if (xQueueSend(fb_queue, &fb, pdMS_TO_TICKS(5)) != pdTRUE) {
+        if (xQueueSend(fbq_rtsp, &fb, 0) != pdTRUE) {
             esp_camera_fb_return(fb);
         }
     }
 }
 
-// JPEG + motion producer: converts YUV422 → JPEG for RTSP, and Y plane → small grayscale for motion_queue
-static void jpeg_rtsp_task(void *arg)
+// 2. Motion Task: consumes downscaled grayscale frames
+static void motion_task(void *arg)
 {
-    (void)arg;
-    ESP_LOGI(TAG, "JPEG/RTSP task started");
+    ESP_LOGI(TAG, "Motion task started");
 
-    // wait until RTSP is started (WiFi IP obtained)
-    while (!wifi_got_ip || !rtsp_started) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+    uint8_t md_frame[MD_W * MD_H];
+
+    while (true) {
+        if (xQueueReceive(motion_gray_q, md_frame, portMAX_DELAY) == pdTRUE) {
+            if (motion_detect(md_frame)) {
+                ESP_LOGI(TAG, "Motion detected");
+                // TODO: MQTT publish if you want
+            }
+        }
     }
+}
+
+// 3. RTSP Task: highest priority, does JPEG + motion every 5th frame
+static void rtsp_task(void *arg)
+{
+    ESP_LOGI(TAG, "RTSP task started");
+
+    while (!wifi_got_ip || !rtsp_started) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    int motion_frame_counter = 0;
 
     while (true) {
         camera_fb_t *fb = nullptr;
-        if (xQueueReceive(fb_queue, &fb, portMAX_DELAY) != pdTRUE || !fb)
+        if (xQueueReceive(fbq_rtsp, &fb, portMAX_DELAY) != pdTRUE)
             continue;
 
-        // --- Build downsampled grayscale for motion (from Y channel of YUV422) ---
-        uint8_t md_frame[MD_W * MD_H];
-        int src_w = fb->width;
-        int src_h = fb->height;
-        int step_x = src_w / MD_W;
-        int step_y = src_h / MD_H;
-        int idx = 0;
+        // --- Motion every Nth frame (Y downscale from YUV422) ---
+        motion_frame_counter++;
+        if (motion_frame_counter >= MOTION_INTERVAL) {
+            motion_frame_counter = 0;
 
-        const uint8_t *src = fb->buf; // YUV422: Y at even bytes
+            uint8_t md_frame[MD_W * MD_H];
+            int src_w = fb->width;
+            int src_h = fb->height;
+            int step_x = src_w / MD_W;
+            int step_y = src_h / MD_H;
+            int idx = 0;
+            const uint8_t *src = fb->buf; // YUV422: Y at even bytes
 
-        for (int y = 0; y < src_h && idx < MD_W * MD_H; y += step_y) {
-            for (int x = 0; x < src_w && idx < MD_W * MD_H; x += step_x) {
-                int pixel_index = y * src_w + x;
-                md_frame[idx++] = src[pixel_index * 2]; // Y component
+            for (int y = 0; y < src_h && idx < MD_W * MD_H; y += step_y) {
+                for (int x = 0; x < src_w && idx < MD_W * MD_H; x += step_x) {
+                    int pixel_index = y * src_w + x;
+                    md_frame[idx++] = src[pixel_index * 2]; // Y component
+                }
             }
+
+            xQueueOverwrite(motion_gray_q, md_frame);
         }
 
-        // push grayscale snapshot to motion_queue (non-blocking overwrite style)
-        xQueueOverwrite(motion_queue, md_frame);
-
-        // --- Encode YUV422 → JPEG for RTSP ---
+        // --- JPEG for RTSP ---
         uint8_t *jpeg_buf = nullptr;
         size_t jpeg_len = 0;
 
@@ -273,24 +280,7 @@ static void jpeg_rtsp_task(void *arg)
         }
 
         esp_camera_fb_return(fb);
-        vTaskDelay(1);
-    }
-}
-
-// Motion consumer: reads grayscale frames from motion_queue, runs detection
-static void motion_task(void *arg)
-{
-    (void)arg;
-    ESP_LOGI(TAG, "Motion task started");
-
-    uint8_t md_frame[MD_W * MD_H];
-
-    while (true) {
-        if (xQueueReceive(motion_queue, md_frame, portMAX_DELAY) == pdTRUE) {
-            if (motion_detect(md_frame)) {
-                ESP_LOGI(TAG, "Motion detected");
-            }
-        }
+        vTaskDelay(1);  // avoid starving idle/WDT
     }
 }
 
@@ -301,30 +291,26 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
 
     wifi_init();
-
     if (!camera_init_safe()) {
         ESP_LOGE(TAG, "Camera not available, stopping");
         return;
     }
 
-    // Create RTSP server once
     espp::RtspServer::Config cfg;
-    cfg.port = 8554;   // only port set, like your old code
-
+    cfg.port = 8554;
     rtsp_server = std::make_shared<espp::RtspServer>(cfg);
 
-    // Queues
-    fb_queue = xQueueCreate(FRAME_QUEUE_LEN, sizeof(camera_fb_t *));
-    motion_queue = xQueueCreate(1, MD_W * MD_H);   // single-slot queue for xQueueOverwrite
-    if (!fb_queue || !motion_queue) {
+    fbq_rtsp = xQueueCreate(FBQ_LEN, sizeof(camera_fb_t *));
+    motion_gray_q = xQueueCreate(MOTIONQ_LEN, MD_W * MD_H);
+    if (!fbq_rtsp || !motion_gray_q) {
         ESP_LOGE(TAG, "Queue create failed");
         return;
     }
 
-    // Tasks
-    xTaskCreatePinnedToCore(capture_task,   "capture", 4096, nullptr, 5, nullptr, 0);
-    xTaskCreatePinnedToCore(jpeg_rtsp_task, "rtsp",    8192, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(motion_task,    "motion",  4096, nullptr, 4, nullptr, 1);
+    // Priorities: RTSP highest
+    xTaskCreatePinnedToCore(capture_task, "capture", 4096, nullptr, 4, nullptr, 0);
+    xTaskCreatePinnedToCore(motion_task,  "motion",  4096, nullptr, 3, nullptr, 1);
+    xTaskCreatePinnedToCore(rtsp_task,    "rtsp",    8192, nullptr, 6, nullptr, 1);
 
-    ESP_LOGI(TAG, "Pipeline running (YUV422 motion + JPEG RTSP)");
+    ESP_LOGI(TAG, "Pipeline running (YUV422 motion + JPEG RTSP, motion every %d frames)", MOTION_INTERVAL);
 }
