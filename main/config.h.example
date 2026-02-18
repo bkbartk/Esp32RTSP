@@ -6,11 +6,11 @@
 
 // Default OTA URL used when triggering OTA without specifying a URL.
 #define OTA_URL_DEFAULT "http://example.com/firmware.bin"
-
+#define ENABLE_OTA false
 // mDNS hostname for the device (used as <name>.local). Example: "espressif"
 // Leave blank to skip mDNS initialization.
 #define MDNS_NAME "espressif"
 
-#define MQTT_HOST "homeassistant.local"
+#define MQTT_URI "homeassistant.local"
 #define MQTT_USERNAME "mqtt_user"
 #define MQTT_PASSWORD "mqtt_pass"

@@ -1,94 +1,148 @@
 #include <cstring>
-#include <stdio.h>
-#include "esp_log.h"
-#include "esp_err.h"
-#include "esp_camera.h"
-#include "rtsp_server.hpp" // C++ RTSP API
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "nvs_flash.h"
-#include "esp_ota_ops.h"
-#include "esp_http_client.h"
-#include "esp_partition.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_http_server.h"
-#include "driver/gpio.h"
-#include "config.h"
-#include "ota.hpp"
-#include "mdns.h"
-#include "mqtt_client.h"
-#include "img_converters.h"
+#include <string>
+#include <memory>
+#include <span>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#ifndef OTA_URL_DEFAULT
-#define OTA_URL_DEFAULT "http://example.com/firmware.bin"
-#endif
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_err.h"
 
-static const char *TAG = "RTSP_CAM";
+#include "esp_camera.h"
+#include "esp_heap_caps.h"
 
-static bool motion_active = false;
-static uint32_t last_motion_time = 0;
-const uint32_t MOTION_TIMEOUT = 3000; // 3 seconds
-const uint32_t MOTION_ON_DELAY = 100; // 100 ms debounce
-static uint32_t motion_start_candidate = 0;
-static esp_mqtt_client_handle_t client;
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "mdns.h"
 
-QueueHandle_t motion_queue;
+#include "rtsp_server.hpp"
+#include "config.h"
+#include "img_converters.h"
 
-void mqtt_init()
+static const char *TAG = "PIPE";
+
+// ---------------- CONFIG ----------------
+
+#define MD_W 40
+#define MD_H 30
+#define FRAME_QUEUE_LEN 4
+#define MOTION_QUEUE_LEN 4
+
+// ---------------- GLOBALS ----------------
+
+static QueueHandle_t fb_queue = nullptr;       // camera_fb_t*
+static QueueHandle_t motion_queue = nullptr;   // uint8_t[MD_W*MD_H]
+
+static uint8_t md_prev[MD_W * MD_H];
+static bool md_prev_valid = false;
+
+static std::shared_ptr<espp::RtspServer> rtsp_server;
+static bool rtsp_started = false;
+static bool wifi_got_ip = false;
+
+// ---------------- CAMERA CONFIG (YUV422 + SVGA) ----------------
+
+static camera_config_t camera_config = {
+    .pin_pwdn  = -1,
+    .pin_reset = -1,
+    .pin_xclk  = 15,
+
+    .pin_sccb_sda = 4,
+    .pin_sccb_scl = 5,
+
+    .pin_d7 = 16,
+    .pin_d6 = 17,
+    .pin_d5 = 18,
+    .pin_d4 = 12,
+    .pin_d3 = 10,
+    .pin_d2 = 8,
+    .pin_d1 = 9,
+    .pin_d0 = 11,
+
+    .pin_vsync = 6,
+    .pin_href  = 7,
+    .pin_pclk  = 13,
+
+    .xclk_freq_hz = 20000000,
+
+    .ledc_timer   = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_YUV422,   // YUV422 for motion + JPEG encode
+    .frame_size   = FRAMESIZE_SVGA,     // 800x600
+    .jpeg_quality = 10,
+    .fb_count     = 2,
+    .fb_location  = CAMERA_FB_IN_PSRAM,
+    .grab_mode    = CAMERA_GRAB_LATEST,
+    .sccb_i2c_port = 0,
+};
+
+// ---------------- MOTION DETECTION ----------------
+
+static bool motion_detect(const uint8_t *curr)
 {
-    std::string uri = "mqtt://" + std::string(MQTT_HOST) + ":1883";
-    std::string lwt_topic = std::string(MDNS_NAME) + "/status";
+    if (!md_prev_valid) {
+        memcpy(md_prev, curr, sizeof(md_prev));
+        md_prev_valid = true;
+        return false;
+    }
 
-    esp_mqtt_client_config_t mqtt_cfg = {};
-    mqtt_cfg.broker.address.uri = uri.c_str();
-    mqtt_cfg.credentials.username = MQTT_USERNAME;
-    mqtt_cfg.credentials.authentication.password = MQTT_PASSWORD;
+    int changed = 0;
+    const int diff_threshold = 20;
+    const int min_pixels = 50;
 
-    mqtt_cfg.session.last_will.topic = lwt_topic.c_str();
-    mqtt_cfg.session.last_will.msg = "offline";
-    mqtt_cfg.session.last_will.qos = 1;
-    mqtt_cfg.session.last_will.retain = true;
+    for (int i = 0; i < MD_W * MD_H; ++i) {
+        if (abs((int)curr[i] - (int)md_prev[i]) > diff_threshold)
+            changed++;
+    }
 
-    client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_start(client);
+    memcpy(md_prev, curr, sizeof(md_prev));
 
-    // Publish online status
-    std::string online_topic = std::string(MDNS_NAME) + "/status";
-    esp_mqtt_client_publish(client, online_topic.c_str(), "online", 0, 1, 1);
+    return changed > min_pixels;
 }
 
-// ---------------- WIFI INIT (C++ SAFE) ----------------
-static void wifi_event_handler(void *arg,
-                               esp_event_base_t event_base,
-                               int32_t event_id,
-                               void *event_data)
+// ---------------- RTSP SEND ----------------
+
+static void rtsp_send_jpeg(const uint8_t *jpeg_buf, size_t jpeg_len)
 {
-    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        auto *event = (ip_event_got_ip_t *)event_data;
+    if (!rtsp_server) return;
+
+    std::span<const uint8_t> jpeg_span(jpeg_buf, jpeg_len);
+    rtsp_server->send_frame(espp::JpegFrame(jpeg_span));
+}
+
+// ---------------- WIFI ----------------
+
+static void wifi_event_handler(void *, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        auto *event = (ip_event_got_ip_t *)data;
 
         char ip_str[16];
         esp_ip4addr_ntoa(&event->ip_info.ip, ip_str, sizeof(ip_str));
 
         ESP_LOGI("WIFI", "IP Address: %s", ip_str);
-        ESP_LOGI("RTSP_CAM", "Stream URL: rtsp://%s:8554/stream", ip_str);
+        wifi_got_ip = true;
+
+        if (rtsp_server && !rtsp_started) {
+            rtsp_server->start();  // default accept timeout
+            rtsp_started = true;
+            ESP_LOGI(TAG, "RTSP server started: rtsp://%s:8554", ip_str);
+        }
     }
 }
 
-static void wifi_init(void)
+static void wifi_init()
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_sta();
 
-    // Register event handlers
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT,
                                                ESP_EVENT_ANY_ID,
                                                &wifi_event_handler,
@@ -121,257 +175,101 @@ static void wifi_init(void)
     ESP_LOGI("WIFI", "Connecting to WiFi...");
 }
 
-// ------------------------------------------------------
+// ---------------- CAMERA INIT ----------------
 
-// ---------------- CAMERA CONFIG -----------------------
-static camera_config_t camera_config = {
-    .pin_pwdn = -1,
-    .pin_reset = -1,
-    .pin_xclk = 15,
-    .pin_sccb_sda = 4,
-    .pin_sccb_scl = 5,
-    .pin_d7 = 16,
-    .pin_d6 = 17,
-    .pin_d5 = 18,
-    .pin_d4 = 12,
-    .pin_d3 = 10,
-    .pin_d2 = 8,
-    .pin_d1 = 9,
-    .pin_d0 = 11,
-    .pin_vsync = 6,
-    .pin_href = 7,
-    .pin_pclk = 13,
-
-    .xclk_freq_hz = 10000000, // 10 MHz
-    .ledc_timer = LEDC_TIMER_0,
-    .ledc_channel = LEDC_CHANNEL_0,
-
-    .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_VGA,
-    .jpeg_quality = 20,
-    .fb_count = 1,
-    .fb_location = CAMERA_FB_IN_PSRAM,
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
-    .sccb_i2c_port = 0,
-};
-
-// ------------------------------------------------------
-
-static void mdns_setup(void)
+static bool camera_init_safe()
 {
-#ifdef MDNS_NAME
-    if (strlen(MDNS_NAME) > 0)
-    {
-        esp_err_t err = mdns_init();
-        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
-        {
-            ESP_LOGW(TAG, "mdns_init failed: %d", err);
-        }
-        else
-        {
-            mdns_hostname_set(MDNS_NAME);
-            mdns_instance_name_set("ESP32 RTSP Camera");
-            mdns_service_add(NULL, "_rtsp._tcp", NULL, 8554, NULL, 0);
-            ESP_LOGI(TAG, "mDNS started: %s.local", MDNS_NAME);
-        }
-    }
-#endif
-}
-
-static bool detect_motion(const std::vector<uint8_t> &prev,
-                          const std::vector<uint8_t> &curr,
-                          int threshold,
-                          float percent)
-{
-    int diff = 0;
-    int total = curr.size();
-
-    for (int i = 0; i < total; i++)
-    {
-        if (abs(curr[i] - prev[i]) > threshold)
-        {
-            diff++;
-        }
-    }
-
-    return diff > total * percent;
-}
-
-struct GrayImage
-{
-    std::vector<uint8_t> data;
-    int w = 0;
-    int h = 0;
-};
-
-static const std::string motion_topic = std::string(MDNS_NAME) + "/motion";
-
-static bool send_motion(bool motion)
-{
-    uint32_t now = esp_log_timestamp();
-    bool changed = false;
-
-    if (motion)
-    {
-        last_motion_time = now;
-
-        if (!motion_active)
-        {
-            if (motion_start_candidate == 0)
-            {
-                motion_start_candidate = now; // first detection
-            }
-
-            if (now - motion_start_candidate > MOTION_ON_DELAY)
-            {
-                motion_active = true;
-                changed = true;
-
-                esp_mqtt_client_publish(client, motion_topic.c_str(), "1", 0, 1, 0);
-            }
-        }
-    }
-    else
-    {
-        motion_start_candidate = 0; // reset ON debounce
-
-        if (motion_active && (now - last_motion_time > MOTION_TIMEOUT))
-        {
-            motion_active = false;
-            changed = true;
-
-            esp_mqtt_client_publish(client, motion_topic.c_str(), "0", 0, 1, 0);
-        }
-    }
-
-    return changed;
-}
-
-void motion_task(void *arg)
-{
-    std::vector<uint8_t> *gray_ptr = nullptr;
-    std::vector<uint8_t> prev;
-
-    while (true)
-    {
-        if (xQueueReceive(motion_queue, &gray_ptr, portMAX_DELAY))
-        {
-
-            auto &gray = *gray_ptr;
-
-            if (!prev.empty() && prev.size() == gray.size())
-            {
-                bool motion = detect_motion(prev, gray, 20, 0.05f);
-                send_motion(motion);
-            }
-
-            prev = gray;
-
-            delete gray_ptr; // free safely
-        }
-    }
-}
-
-void start_motion_task()
-{
-    motion_queue = xQueueCreate(1, sizeof(std::vector<uint8_t> *));
-    xTaskCreatePinnedToCore(motion_task, "motion_task", 4096, nullptr, 5, nullptr, 1);
-}
-// RSTP SESSION HOTFIX
-#include <fcntl.h>
-#include <unistd.h>
-
-void restart_camera()
-{
-    esp_camera_deinit();
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-
     esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera init failed: %s", esp_err_to_name(err));
+        return false;
+    }
 
-    if (err != ESP_OK)
-    {
-        ESP_LOGE("CAM", "Camera re-init failed: %s", esp_err_to_name(err));
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_brightness(s, 1);
+        s->set_contrast(s, 1);
+        s->set_saturation(s, 0);
+        s->set_gainceiling(s, GAINCEILING_4X);
     }
-    else
-    {
-        ESP_LOGI("CAM", "Camera re-initialized");
-    }
+
+    ESP_LOGI(TAG, "Camera initialized");
+    return true;
 }
 
-static constexpr int MAX_POSSIBLE_FDS = 64;
+// ---------------- TASKS ----------------
 
-int get_free_fd_count()
+// Capture: only grabs frames and pushes fb* to fb_queue
+static void capture_task(void *arg)
 {
-    int used = 0;
+    (void)arg;
+    ESP_LOGI(TAG, "Capture task started");
 
-    for (int fd = 0; fd < MAX_POSSIBLE_FDS; fd++)
-    {
-        if (fcntl(fd, F_GETFD) != -1)
-        {
-            used++;
+    while (true) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (xQueueSend(fb_queue, &fb, pdMS_TO_TICKS(5)) != pdTRUE) {
+            esp_camera_fb_return(fb);
         }
     }
-
-    return MAX_POSSIBLE_FDS - used;
 }
 
-volatile bool rtsp_error_detected = false;
-static char rtsp_log_buffer[256]; // static = no stack usage
-
-
-void camera_main_loop()
+// JPEG + motion producer: converts YUV422 → JPEG for RTSP, and Y plane → small grayscale for motion_queue
+static void jpeg_rtsp_task(void *arg)
 {
-    // ---- Correct RTSP API ----
-    espp::RtspServer::Config rtsp_cfg;
-    rtsp_cfg.port = 8554;
+    (void)arg;
+    ESP_LOGI(TAG, "JPEG/RTSP task started");
 
-    espp::RtspServer server{rtsp_cfg};
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // 1 second
-    server.start();
+    // wait until RTSP is started (WiFi IP obtained)
+    while (!wifi_got_ip || !rtsp_started) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
-    // --------------------------
-
-    std::vector<uint8_t> rgb;
-    std::vector<uint8_t> gray;
-
-    while (true)
-    {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb)
+    while (true) {
+        camera_fb_t *fb = nullptr;
+        if (xQueueReceive(fb_queue, &fb, portMAX_DELAY) != pdTRUE || !fb)
             continue;
 
-        // --- RTSP send ---
-        std::span<const uint8_t> jpeg_span(fb->buf, fb->len);
-        server.send_frame(espp::JpegFrame(jpeg_span));
+        // --- Build downsampled grayscale for motion (from Y channel of YUV422) ---
+        uint8_t md_frame[MD_W * MD_H];
+        int src_w = fb->width;
+        int src_h = fb->height;
+        int step_x = src_w / MD_W;
+        int step_y = src_h / MD_H;
+        int idx = 0;
 
-        // --- Resize buffers once ---
-        size_t rgb_size = fb->width * fb->height * 3;
-        size_t gray_size = fb->width * fb->height;
+        const uint8_t *src = fb->buf; // YUV422: Y at even bytes
 
-        if (rgb.size() != rgb_size)
-            rgb.resize(rgb_size);
-        if (gray.size() != gray_size)
-            gray.resize(gray_size);
-
-        // --- JPEG → RGB ---
-        if (fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb.data()))
-        {
-
-            // --- RGB → grayscale ---
-            for (int i = 0, j = 0; i < rgb_size; i += 3, j++)
-            {
-                uint8_t r = rgb[i];
-                uint8_t g = rgb[i + 1];
-                uint8_t b = rgb[i + 2];
-                gray[j] = (r * 30 + g * 59 + b * 11) / 100;
+        for (int y = 0; y < src_h && idx < MD_W * MD_H; y += step_y) {
+            for (int x = 0; x < src_w && idx < MD_W * MD_H; x += step_x) {
+                int pixel_index = y * src_w + x;
+                md_frame[idx++] = src[pixel_index * 2]; // Y component
             }
+        }
 
-            // --- Send grayscale to motion task ---
-            if (uxQueueMessagesWaiting(motion_queue) == 0)
-            {
-                auto *frame = new std::vector<uint8_t>(gray); // allocate on heap
-                xQueueSend(motion_queue, &frame, 0);
-            }
+        // push grayscale snapshot to motion_queue (non-blocking overwrite style)
+        xQueueOverwrite(motion_queue, md_frame);
+
+        // --- Encode YUV422 → JPEG for RTSP ---
+        uint8_t *jpeg_buf = nullptr;
+        size_t jpeg_len = 0;
+
+        bool ok = fmt2jpg(fb->buf, fb->len,
+                          fb->width, fb->height,
+                          PIXFORMAT_YUV422,
+                          camera_config.jpeg_quality,
+                          &jpeg_buf, &jpeg_len);
+
+        if (ok && jpeg_buf) {
+            ESP_LOGI(TAG, "JPEG size = %u", (unsigned)jpeg_len);
+            rtsp_send_jpeg(jpeg_buf, jpeg_len);
+            free(jpeg_buf);
+        } else {
+            ESP_LOGE(TAG, "JPEG encode failed");
         }
 
         esp_camera_fb_return(fb);
@@ -379,82 +277,54 @@ void camera_main_loop()
     }
 }
 
-static void ota()
+// Motion consumer: reads grayscale frames from motion_queue, runs detection
+static void motion_task(void *arg)
 {
-    httpd_handle_t server_handle = NULL;
-    httpd_config_t http_config = HTTPD_DEFAULT_CONFIG();
-    http_config.server_port = 8080;
+    (void)arg;
+    ESP_LOGI(TAG, "Motion task started");
 
-    auto ota_http_handler = [](httpd_req_t *req) -> esp_err_t
-    {
-        char urlbuf[256] = {0};
-        char qsbuf[256] = {0};
+    uint8_t md_frame[MD_W * MD_H];
 
-        // Optional: /ota?url=http://server/firmware.bin
-        if (httpd_req_get_url_query_str(req, qsbuf, sizeof(qsbuf)) == ESP_OK)
-        {
-            char value[256];
-            if (httpd_query_key_value(qsbuf, "url", value, sizeof(value)) == ESP_OK)
-            {
-                strncpy(urlbuf, value, sizeof(urlbuf) - 1);
+    while (true) {
+        if (xQueueReceive(motion_queue, md_frame, portMAX_DELAY) == pdTRUE) {
+            if (motion_detect(md_frame)) {
+                ESP_LOGI(TAG, "Motion detected");
             }
         }
-
-        const char *chosen = urlbuf[0] ? urlbuf : OTA_URL_DEFAULT;
-
-        if (start_ota_from_url(chosen) == ESP_OK)
-        {
-            httpd_resp_send(req, "OTA started\n", HTTPD_RESP_USE_STRLEN);
-        }
-        else
-        {
-            httpd_resp_send(req, "OTA failed\n", HTTPD_RESP_USE_STRLEN);
-        }
-
-        return ESP_OK;
-    };
-
-    if (httpd_start(&server_handle, &http_config) == ESP_OK)
-    {
-        httpd_uri_t ota_uri = {
-            .uri = "/ota2",
-            .method = HTTP_GET,
-            .handler = ota_http_handler,
-            .user_ctx = nullptr,
-        };
-        httpd_register_uri_handler(server_handle, &ota_uri);
     }
 }
 
+// ---------------- MAIN ----------------
+
 extern "C" void app_main(void)
 {
-    wifi_init();
-    ota();
-    // Initialize mDNS (if configured)
-    mdns_setup();
-    mqtt_init();
+    ESP_ERROR_CHECK(nvs_flash_init());
 
-    ESP_LOGI(TAG, "Initialising camera...");
-    if (esp_camera_init(&camera_config) != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Camera init failed");
+    wifi_init();
+
+    if (!camera_init_safe()) {
+        ESP_LOGE(TAG, "Camera not available, stopping");
         return;
     }
 
-    sensor_t *s = esp_camera_sensor_get();
-    s->set_vflip(s, 1);
-    s->set_aec2(s, 1);
+    // Create RTSP server once
+    espp::RtspServer::Config cfg;
+    cfg.port = 8554;   // only port set, like your old code
 
-    ESP_LOGI(TAG, "Warming up camera...");
-    for (int i = 0; i < 10; i++)
-    {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb)
-            esp_camera_fb_return(fb);
-        vTaskDelay(30 / portTICK_PERIOD_MS);
+    rtsp_server = std::make_shared<espp::RtspServer>(cfg);
+
+    // Queues
+    fb_queue = xQueueCreate(FRAME_QUEUE_LEN, sizeof(camera_fb_t *));
+    motion_queue = xQueueCreate(1, MD_W * MD_H);   // single-slot queue for xQueueOverwrite
+    if (!fb_queue || !motion_queue) {
+        ESP_LOGE(TAG, "Queue create failed");
+        return;
     }
-    ESP_LOGI(TAG, "Camera ready.");
 
-    start_motion_task();
-    camera_main_loop(); // never returns
+    // Tasks
+    xTaskCreatePinnedToCore(capture_task,   "capture", 4096, nullptr, 5, nullptr, 0);
+    xTaskCreatePinnedToCore(jpeg_rtsp_task, "rtsp",    8192, nullptr, 5, nullptr, 1);
+    xTaskCreatePinnedToCore(motion_task,    "motion",  4096, nullptr, 4, nullptr, 1);
+
+    ESP_LOGI(TAG, "Pipeline running (YUV422 motion + JPEG RTSP)");
 }
