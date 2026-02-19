@@ -6,7 +6,8 @@
 
 // Default OTA URL used when triggering OTA without specifying a URL.
 #define OTA_URL_DEFAULT "http://example.com/firmware.bin"
-#define ENABLE_OTA false
+#define ENABLE_OTA 0 //Removed for now
+#define ENABLE_MOTION 0
 // mDNS hostname for the device (used as <name>.local). Example: "espressif"
 // Leave blank to skip mDNS initialization.
 #define MDNS_NAME "espressif"
