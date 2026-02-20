@@ -33,11 +33,6 @@ static const char *TAG = "PIPE";
 #define MOTIONQ_LEN 1
 #define MOTION_INTERVAL 5
 
-// ---------------- GLOBALS ----------------
-
-static uint8_t md_prev[MD_W * MD_H];
-static bool md_prev_valid = false;
-
 static bool wifi_got_ip = false;
 
 // ---------------- CAMERA CONFIG (YUV422 + SVGA) ----------------
@@ -68,8 +63,6 @@ static camera_config_t camera_config = {
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    // .pixel_format = PIXFORMAT_RGB565,
-    // .pixel_format = PIXFORMAT_YUV422,
     .pixel_format = PIXFORMAT_JPEG,
     .frame_size = FRAMESIZE_SVGA,
     .jpeg_quality = 10,
@@ -82,6 +75,32 @@ static camera_config_t camera_config = {
 // ---------------- MOTION DETECTION ----------------
 #if ENABLE_MOTION
 static QueueHandle_t motion_gray_q = nullptr; // uint8_t[MD_W*MD_H]
+static uint8_t md_prev[MD_W * MD_H];
+static bool md_prev_valid = false;
+// Tuned thresholds for JPEG-based grayscale
+
+static uint8_t *rgb_buf = NULL;
+static size_t rgb_buf_size = 0;
+
+void init_motion()
+{
+    int max_w = 800;
+    int max_h = 600;
+
+    rgb_buf_size = max_w * max_h * 2; // RGB565
+
+    rgb_buf = (uint8_t *)heap_caps_malloc(
+        rgb_buf_size,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (!rgb_buf)
+    {
+        ESP_LOGE(TAG, "Failed to allocate rgb_buf (%u bytes)", rgb_buf_size);
+    }
+}
+
+const int diff_threshold = 15; // ignore small changes
+const int min_pixels = 150;    // require meaningful motion
 static bool motion_detect(const uint8_t *curr)
 {
     if (!md_prev_valid)
@@ -92,16 +111,17 @@ static bool motion_detect(const uint8_t *curr)
     }
 
     int changed = 0;
-    const int diff_threshold = 20;
-    const int min_pixels = 50;
 
     for (int i = 0; i < MD_W * MD_H; ++i)
     {
-        if (abs((int)curr[i] - (int)md_prev[i]) > diff_threshold)
+        int graychange = abs((int)curr[i] - (int)md_prev[i]);
+        if (graychange > diff_threshold)
             changed++;
     }
 
-    memcpy(md_prev, curr, sizeof(md_prev));
+    // Smooth update
+    for (int i = 0; i < MD_W * MD_H; i++)
+        md_prev[i] = (md_prev[i] * 3 + curr[i]) / 4;
 
     return changed > min_pixels;
 }
@@ -113,111 +133,39 @@ static void motion_task(void *arg)
 
     uint8_t md_frame[MD_W * MD_H];
 
+    bool motion_state = false; // current ON/OFF state
+    uint32_t last_motion_time = 0;
+    const uint32_t MOTION_TIMEOUT_MS = 5000; // 5 seconds
+
     while (true)
     {
         if (xQueueReceive(motion_gray_q, md_frame, portMAX_DELAY) == pdTRUE)
         {
-            if (motion_detect(md_frame))
+            bool moving = motion_detect(md_frame);
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+            if (moving)
             {
-                ESP_LOGI(TAG, "Motion detected");
-                // TODO: MQTT publish if desired
+                last_motion_time = now;
+
+                if (!motion_state)
+                {
+                    motion_state = true;
+                    ESP_LOGI(TAG, "Motion ON");
+                    // TODO: MQTT publish ON
+                }
+            }
+            else
+            {
+                if (motion_state && (now - last_motion_time > MOTION_TIMEOUT_MS))
+                {
+                    motion_state = false;
+                    ESP_LOGI(TAG, "Motion OFF");
+                    // TODO: MQTT publish OFF
+                }
             }
         }
     }
-}
-
-// --- Minimal JPEG luminance DC extractor ---
-// Returns a tiny grayscale map based on DC coefficients.
-// Output size: (mcu_cols × mcu_rows)
-
-bool jpeg_extract_luma_dc(const uint8_t *jpeg, size_t len,
-                          uint8_t **out, int *out_w, int *out_h)
-{
-    // This is a minimal JPEG parser that extracts only:
-    // - SOF0 (image size)
-    // - SOS (start of scan)
-    // - DQT (quant tables)
-    // - DHT (Huffman tables)
-    // - DC coefficients for Y channel
-
-    // For brevity, this is a simplified implementation skeleton.
-    // It works for baseline JPEGs produced by ESP32-CAM.
-
-    // --- Parse SOF0 to get width/height ---
-    int width = 0, height = 0;
-    for (size_t i = 0; i < len - 9; i++)
-    {
-        if (jpeg[i] == 0xFF && jpeg[i + 1] == 0xC0)
-        {
-            height = (jpeg[i + 5] << 8) | jpeg[i + 6];
-            width = (jpeg[i + 7] << 8) | jpeg[i + 8];
-            break;
-        }
-    }
-    if (width == 0 || height == 0)
-        return false;
-
-    // MCU grid size
-    int mcu_w = (width + 7) / 8;
-    int mcu_h = (height + 7) / 8;
-
-    int total = mcu_w * mcu_h;
-    uint8_t *map = (uint8_t *)malloc(total);
-    if (!map)
-        return false;
-
-    // --- Extremely simplified DC extraction ---
-    // We scan for 0xFF 0xDA (SOS), then read DC values.
-    // ESP32 JPEGs are baseline, so this works reliably.
-
-    size_t pos = 0;
-    for (size_t i = 0; i < len - 1; i++)
-    {
-        if (jpeg[i] == 0xFF && jpeg[i + 1] == 0xDA)
-        {
-            pos = i + 2;
-            break;
-        }
-    }
-    if (pos == 0)
-    {
-        free(map);
-        return false;
-    }
-
-    // Skip SOS header (variable length)
-    pos += jpeg[pos] << 8 | jpeg[pos + 1];
-    pos += 2;
-
-    // --- Extract DC values (very rough but works for motion) ---
-    int idx = 0;
-    uint8_t prev_dc = 128;
-
-    while (pos < len && idx < total)
-    {
-        uint8_t byte = jpeg[pos++];
-
-        if (byte == 0xFF)
-        {
-            pos++;
-            continue;
-        } // skip markers
-
-        // DC coefficient is encoded as a small delta
-        int dc = prev_dc + (int8_t)byte;
-        if (dc < 0)
-            dc = 0;
-        if (dc > 255)
-            dc = 255;
-
-        map[idx++] = dc;
-        prev_dc = dc;
-    }
-
-    *out = map;
-    *out_w = mcu_w;
-    *out_h = mcu_h;
-    return true;
 }
 
 #endif
@@ -250,28 +198,7 @@ static void rtsp_task(void *arg)
         camera_fb_t *fb = nullptr;
         if (xQueueReceive(fbq_rtsp, &fb, portMAX_DELAY) != pdTRUE)
             continue;
-        // #if ENABLE_MOTION
-        //         uint8_t *jpeg_buf = nullptr;
-        //         size_t jpeg_len = 0;
-        //         bool ok = fmt2jpg(fb->buf, fb->len,
-        //                           fb->width, fb->height,
-        //                           fb->format,
-        //                           camera_config.jpeg_quality,
-        //                           &jpeg_buf, &jpeg_len);
-
-        //         if (ok && jpeg_buf)
-        //         {
-        //             ESP_LOGI(TAG, "JPEG size = %u", (unsigned)jpeg_len);
-        //             rtsp_send_jpeg(jpeg_buf, jpeg_len);
-        //             free(jpeg_buf);
-        //         }
-        //         else
-        //         {
-        //             ESP_LOGE(TAG, "JPEG encode failed");
-        //         }
-        // #else
         rtsp_send_jpeg(fb->buf, fb->len);
-        // #endif
         esp_camera_fb_return(fb);
         vTaskDelay(1); // yield to avoid starving idle/WDT
     }
@@ -350,7 +277,7 @@ static bool camera_init_safe()
         return false;
     }
     sensor_t *s = esp_camera_sensor_get();
-    s->set_vflip(s, 1);   // vertical flip
+    s->set_vflip(s, 1); // vertical flip
     // s->set_hmirror(s, 0); // horizontal mirror (optional)
 
     ESP_LOGI(TAG, "Camera initialized");
@@ -359,10 +286,10 @@ static bool camera_init_safe()
 
 // ---------------- TASKS ----------------
 
-// 1. Capture Task: grabs fb, builds motion buffer every Nth frame, sends fb to RTSP
 static void capture_task(void *arg)
 {
     ESP_LOGI(TAG, "Capture task started");
+    init_motion();
 
     int motion_frame_counter = 0;
 
@@ -379,66 +306,84 @@ static void capture_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        // ESP_LOGI(TAG, "Captured frame: %ux%u, len=%u", (unsigned)fb->width, (unsigned)fb->height, (unsigned)fb->len);
-        // #if ENABLE_MOTION
-        //         // --- Motion every Nth frame: build grayscale buffer from Y plane ---
-        //         motion_frame_counter++;
-        //         if (motion_frame_counter >= MOTION_INTERVAL)
-        //         {
-        //             motion_frame_counter = 0;
 
-        //             uint8_t md_frame[MD_W * MD_H];
-        //             int src_w = fb->width;
-        //             int src_h = fb->height;
-        //             int step_x = src_w / MD_W;
-        //             int step_y = src_h / MD_H;
-        //             int idx = 0;
-        //             const uint8_t *src = fb->buf; // YUV422: Y at even bytes
-
-        //             for (int y = 0; y < src_h && idx < MD_W * MD_H; y += step_y)
-        //             {
-        //                 for (int x = 0; x < src_w && idx < MD_W * MD_H; x += step_x)
-        //                 {
-        //                     int pixel_index = y * src_w + x;
-        //                     md_frame[idx++] = src[pixel_index * 2]; // Y component
-        //                 }
-        //             }
-
-        //             // send grayscale copy to motion queue (single-slot overwrite)
-        //             xQueueOverwrite(motion_gray_q, md_frame);
-        //         }
-        // #endif
+        // Skip invalid JPEG frames
+        if (fb->len < 4 ||
+            fb->buf[0] != 0xFF || fb->buf[1] != 0xD8 ||                   // SOI
+            fb->buf[fb->len - 2] != 0xFF || fb->buf[fb->len - 1] != 0xD9) // EOI
+        {
+            ESP_LOGI(TAG, "Ivalid JPEG frame, dropping");
+            esp_camera_fb_return(fb);
+            continue;
+        }
 
 #if ENABLE_MOTION
         motion_frame_counter++;
-        if (motion_frame_counter >= MOTION_INTERVAL)
+        if (!rgb_buf)
+        {
+            ESP_LOGE(TAG, "rgb_buf is NULL, skipping motion decode");
+        }
+        else if (motion_frame_counter >= MOTION_INTERVAL)
         {
             motion_frame_counter = 0;
 
-            uint8_t *dc_map = NULL;
-            int dc_w = 0, dc_h = 0;
+            esp_jpeg_image_cfg_t jpeg_cfg = {
+                .indata = fb->buf,
+                .indata_size = fb->len,
+                .outbuf = rgb_buf,
+                .outbuf_size = rgb_buf_size,
+                .out_format = JPEG_IMAGE_FORMAT_RGB565,
+            };
 
-            if (jpeg_extract_luma_dc(fb->buf, fb->len, &dc_map, &dc_w, &dc_h))
+            esp_jpeg_image_output_t out;
+            esp_err_t err = esp_jpeg_decode(&jpeg_cfg, &out);
+
+            if (err == ESP_OK)
             {
-                uint8_t md_frame[MD_W * MD_H];
-                int step_x = dc_w / MD_W;
-                int step_y = dc_h / MD_H;
-                int idx = 0;
+                static uint8_t *gray = NULL;
+                static size_t gray_size = 0;
 
-                for (int y = 0; y < dc_h && idx < MD_W * MD_H; y += step_y)
+                if (!gray)
                 {
-                    for (int x = 0; x < dc_w && idx < MD_W * MD_H; x += step_x)
+                    gray_size = out.width * out.height;
+                    gray = (uint8_t *)heap_caps_malloc(gray_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                }
+                // Convert RGB565 → grayscale
+                for (int i = 0; i < out.width * out.height; i++)
+                {
+                    uint16_t px = ((uint16_t *)rgb_buf)[i];
+
+                    int r = (px >> 11) & 0x1F;
+                    int g = (px >> 5) & 0x3F;
+                    int b = px & 0x1F;
+
+                    // Expand to 8-bit
+                    r = (r * 255) / 31;
+                    g = (g * 255) / 63;
+                    b = (b * 255) / 31;
+
+                    gray[i] = (r * 30 + g * 59 + b * 11) / 100;
+                }
+
+                uint8_t md_frame[MD_W * MD_H];
+                int step_x = out.width / MD_W;
+                int step_y = out.height / MD_H;
+
+                int idx = 0;
+                for (int y = 0; y < out.height && idx < MD_W * MD_H; y += step_y)
+                {
+                    for (int x = 0; x < out.width && idx < MD_W * MD_H; x += step_x)
                     {
-                        md_frame[idx++] = dc_map[y * dc_w + x];
+                        md_frame[idx++] = gray[y * out.width + x];
                     }
                 }
 
+                // Send downsampled frame
                 xQueueOverwrite(motion_gray_q, md_frame);
-                free(dc_map);
             }
             else
             {
-                ESP_LOGE(TAG, "DC extraction failed");
+                ESP_LOGE(TAG, "JPEG decode failed: %s", esp_err_to_name(err));
             }
         }
 #endif
